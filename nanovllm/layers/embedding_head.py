@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from ..utils.context import get_context
 
 
 class VocabParallelEmbedding(nn.Module):
@@ -51,3 +52,36 @@ class VocabParallelEmbedding(nn.Module):
         if self.tp_size > 1:
             dist.all_reduce(output, op=dist.ReduceOp.SUM)
         return output
+
+
+# weight tying with embedding layer
+class ParallelLMHead(VocabParallelEmbedding):
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__(num_embeddings, embedding_dim)
+
+    # x: [batch_size, seq_len, hidden_size]
+    # weight: [vocab_size_per_partition, hidden_size]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        context = get_context()
+        if context.is_prefill:
+            # cu_seqlens_q = [0, 5, 8, 12]
+            # last_indices = [5, 8, 12] - 1 = [4, 7, 11]
+            last_token = context.cu_seqlens_q[1:] - 1  # exclude the first element which is 0
+            x = x[last_token].contiguous()
+
+        # logits: [batch_size, seq_len, vocab_size_per_partition]
+        # F.linear automatically transpose the weight
+        logits = torch.nn.functional.linear(x, self.weight)
+        if self.tp_size > 1:
+            # prepare for all_gather only for GPU 0 which is the main GPU
+            all_logits = [torch.empty(logits.size(), device=logits.device) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
+            # dist.gather collects the logits from all GPUs to GPU 0
+            dist.gather(logits, gather_list=all_logits, dst=0)
+            # concatenate
+            if self.tp_rank == 0:
+                # [batch_size, seq_len, padded_vocab_size]
+                logits = torch.cat(all_logits, dim=-1)
+                # trim to original vocab size
+                logits = logits[..., :self.num_embeddings]
+
+        return logits
